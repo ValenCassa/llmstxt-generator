@@ -1,0 +1,224 @@
+# Providers
+
+Providers allow you to interact with cloud services.
+
+A provider is what allows SST to interact with the APIs of various cloud services. These are packages that can be installed through your `sst.config.ts`.
+
+> **Watch a video about providers in SST**  
+> [Watch a video about providers in SST](https://youtu.be/rlR2f5N9mW4)
+
+SST is built on Pulumi/Terraform and **supports 150+ providers**. This includes the major clouds like AWS, Azure, and GCP; but also services like Cloudflare, Stripe, Vercel, Auth0, etc.
+
+Check out the full list in the [Directory](https://sst.dev/docs/all-providers#directory).
+
+---
+
+## Install
+
+To add a provider to your app run:
+
+```bash
+sst add <provider>
+```
+
+This command adds the provider to your config, installs the packages, and adds the namespace of the provider to your globals.
+
+> **Caution**  
+> Do not `import` the provider packages in your `sst.config.ts`.
+
+SST manages these packages internally and you do not need to import the package in your `sst.config.ts`.
+
+> **Tip**  
+> Your app can have multiple providers.
+
+The name of a provider comes from the **name of the package** in the [Directory](https://sst.dev/docs/all-providers#directory). For example, `sst add planetscale`, will add the following to your `sst.config.ts`:
+
+```ts
+{
+  providers: {
+    planetscale: "0.0.7"
+  }
+}
+```
+
+You can add multiple providers to your app:
+
+```ts
+{
+  providers: {
+    aws: "6.27.0",
+    cloudflare: "5.37.1"
+  }
+}
+```
+
+Read more about the [sst add](https://sst.dev/docs/reference/cli/#add) command.
+
+---
+
+## Configure
+
+You can configure a provider in your `sst.config.ts`. For example, to change the region for AWS:
+
+```ts
+{
+  providers: {
+    aws: {
+      region: "us-west-2"
+    }
+  }
+}
+```
+
+You can check out the available list of options that you can configure for a provider over on the provider’s docs. For example, here are the ones for [AWS](https://www.pulumi.com/registry/packages/aws/api-docs/provider/#inputs) and [Cloudflare](https://www.pulumi.com/registry/packages/cloudflare/api-docs/provider/#inputs).
+
+---
+
+### Versions
+
+By default, SST installs the latest version. If you want to use a specific version, you can change it in your config:
+
+```ts
+{
+  providers: {
+    aws: {
+      version: "6.27.0"
+    }
+  }
+}
+```
+
+If you make any changes to the `providers` in your config, you’ll need to run `sst install`.
+
+> **Tip**  
+> You’ll need to run `sst install` if you update the `providers` in your config.
+
+The version of the provider is always pinned to what’s in the `sst.config.ts` and does not auto-update. This is the case, even if there is no version set. This is to make sure that the providers don’t update in the middle of your dev workflow.
+
+> **Note**  
+> Providers don’t auto-update. They stick to the version that was installed initially.
+
+So if you want to update it, you’ll need to change it manually and run `sst install`.
+
+---
+
+### Credentials
+
+Most providers will read your credentials from the environment. For example, for Cloudflare you might set your token like so:
+
+```bash
+export CLOUDFLARE_API_TOKEN=aaaaaaaa_aaaaaaaaaaaa_aaaaaaaa
+```
+
+However, some providers also allow you to pass in the credentials through the config:
+
+```ts
+{
+  providers: {
+    cloudflare: {
+      apiToken: "aaaaaaaa_aaaaaaaaaaaa_aaaaaaaa"
+    }
+  }
+}
+```
+
+Read more about [configuring providers](https://sst.dev/docs/reference/config/#providers).
+
+---
+
+## Components
+
+The provider packages come with components that you can use in your app.
+
+For example, running `sst add aws` will allow you to use all the components under the `aws` namespace:
+
+```ts
+new aws.s3.BucketV2("b", {
+  bucket: "mybucket",
+  tags: {
+    Name: "My bucket"
+  }
+});
+```
+
+Aside from components in the providers, SST also has a list of built-in components. These are typically higher level components that make it easy to add features to your app.
+
+You can check these out in the sidebar. Read more about [Components](https://sst.dev/docs/components/).
+
+---
+
+## Functions
+
+Aside from the components, there are a collection of functions that are exposed by a provider. These are listed in the Pulumi docs as `getXXXXXX` on the sidebar.
+
+For example, to get the AWS account being used in your app:
+
+```ts
+const current = await aws.getCallerIdentity({});
+const accountId = current.accountId;
+const callerArn = current.arn;
+const callerUser = current.userId;
+```
+
+Or to get the current region:
+
+```ts
+const current = await aws.getRegion({});
+const region = current.name;
+```
+
+---
+
+### Output versions
+
+The above are *async* methods that return promises. That means that if you call these in your app, they’ll block the deployment of any resources that are defined after it.
+
+> **Tip**  
+> Outputs don’t block your deployments.
+
+So we instead recommend using the *Output* version of these functions. For example, if we wanted to set the above as environment variables in a function, we would do something like this:
+
+```ts
+new sst.aws.Function("MyFunction", {
+  handler: "src/lambda.handler",
+  environment: {
+    ACCOUNT: aws.getCallerIdentityOutput({}).accountId,
+    REGION: aws.getRegionOutput().name
+  }
+});
+```
+
+The `aws.getXXXXOutput` functions typically return an object of type *`Output<primitive>`*. Read more about [Outputs](https://sst.dev/docs/components/#outputs).
+
+---
+
+## Instances
+
+You can create multiple instances of a provider that’s in your config. By default SST creates one instance of each provider in your `sst.config.ts` with the defaults. By you can create multiple instances in your app:
+
+```ts
+const useast1 = new aws.Provider("AnotherAWS");
+```
+
+This is useful for multi-region or multi-account deployments.
+
+---
+
+### Multi-region
+
+You might want to create multiple providers in cases where some resources in your app need to go to one region, while others need to go to a separate region.
+
+Let’s look at an example. Assume your app is normally deployed to `us-west-1`. But you need to create an ACM certificate that needs to be deployed to `us-east-1`:
+
+```ts
+const useast1 = new aws.Provider("useast1", { region: "us-east-1" });
+
+new sst.aws.Function("MyFunction", "src/lambda.handler");
+
+new aws.acm.Certificate("cert", {
+  domainName: "foo.com",
+  validationMethod: "EMAIL",
+}, { provider: useast1 });
+```
+
+Here the function is created in your default region, `us-west-1`. While the certificate is created in `us-east-1`.

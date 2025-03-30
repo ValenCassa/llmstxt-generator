@@ -1,0 +1,257 @@
+# Bun on AWS with SST
+
+Create and deploy a Bun app to AWS with SST.
+
+We are going to build an app with Bun, add an S3 Bucket for file uploads, and deploy it to AWS in a container with SST.
+
+Before you get started, make sure to [configure your AWS credentials](/docs/iam-credentials#credentials).
+
+---
+
+## Examples
+
+We also have a few other Bun examples that you can refer to:
+- [Deploy Bun with Elysia in a container](/docs/examples/#aws-bun-elysia-container)
+- [Build a hit counter with Bun and Redis](/docs/examples/#aws-bun-redis)
+
+---
+
+## 1. Create a project
+
+Let’s start by creating our Bun app.
+
+```bash
+mkdir aws-bun && cd aws-bun
+bun init -y
+```
+
+### Init Bun Serve
+
+Replace your `index.ts` with the following:
+
+```javascript
+const server = Bun.serve({
+  async fetch(req) {
+    const url = new URL(req.url);
+    if (url.pathname === "/" && req.method === "GET") {
+      return new Response("Hello World!");
+    }
+    return new Response("404!");
+  },
+});
+
+console.log(`Listening on ${server.url}`);
+```
+
+This starts up an HTTP server by default on port `3000`.
+
+---
+
+### Add scripts
+
+Add the following to your `package.json`:
+
+```json
+"scripts": {
+  "dev": "bun run --watch index.ts"
+},
+```
+
+This adds a `dev` script with a watcher.
+
+---
+
+### Init SST
+
+Now let’s initialize SST in our app.
+
+```bash
+bunx sst init
+bun install
+```
+
+This’ll create an `sst.config.ts` file in your project root and install SST.
+
+---
+
+## 2. Add a Service
+
+To deploy our Bun app, let’s add an [AWS Fargate](https://aws.amazon.com/fargate/) container with [Amazon ECS](https://aws.amazon.com/ecs/). Update your `sst.config.ts`:
+
+```javascript
+async run() {
+  const vpc = new sst.aws.Vpc("MyVpc");
+  const cluster = new sst.aws.Cluster("MyCluster", { vpc });
+  new sst.aws.Service("MyService", {
+    cluster,
+    loadBalancer: {
+      ports: [{ listen: "80/http", forward: "3000/http" }],
+    },
+    dev: {
+      command: "bun dev",
+    },
+  });
+}
+```
+
+This creates a VPC with an ECS Cluster, and adds a Fargate service to it.
+
+> **Note:** By default, your service is not deployed when running in *dev*.
+
+The `dev.command` tells SST to instead run our Bun app locally in dev mode.
+
+---
+
+### Start dev mode
+
+Run the following to start dev mode. This’ll start SST and your Bun app.
+
+```bash
+bun sst dev
+```
+
+Once complete, click on **MyService** in the sidebar and open your Bun app in your browser.
+
+---
+
+## 3. Add an S3 Bucket
+
+Let’s add an S3 Bucket for file uploads. Add this to your `sst.config.ts` below the `Vpc` component:
+
+```typescript
+const bucket = new sst.aws.Bucket("MyBucket");
+```
+
+### Link the bucket
+
+Now, link the bucket to the container:
+
+```typescript
+new sst.aws.Service("MyService", {
+  // ...
+  link: [bucket],
+});
+```
+
+This will allow us to reference the bucket in our Bun app.
+
+---
+
+## 4. Upload a file
+
+We want a `POST` request made to the `/` route to upload a file to our S3 bucket. Let’s add this below our *Hello World* route in our `index.ts`:
+
+```typescript
+if (url.pathname === "/" && req.method === "POST") {
+  const formData = await req.formData();
+  const file = formData.get("file")! as File;
+  const params = {
+    Bucket: Resource.MyBucket.name,
+    ContentType: file.type,
+    Key: file.name,
+    Body: file,
+  };
+  const upload = new Upload({
+    params,
+    client: s3,
+  });
+  await upload.done();
+  return new Response("File uploaded successfully.");
+}
+```
+
+> **Tip:** We are directly accessing our S3 bucket with `Resource.MyBucket.name`.
+
+---
+
+## 5. Download the file
+
+We’ll add a `/latest` route that’ll download the latest file in our S3 bucket. Let’s add this below our upload route in `index.ts`:
+
+```typescript
+if (url.pathname === "/latest" && req.method === "GET") {
+  const objects = await s3.send(
+    new ListObjectsV2Command({
+      Bucket: Resource.MyBucket.name,
+    }),
+  );
+  const latestFile = objects.Contents!.sort(
+    (a, b) =>
+      (b.LastModified?.getTime() ?? 0) - (a.LastModified?.getTime() ?? 0),
+  )[0];
+  const command = new GetObjectCommand({
+    Key: latestFile.Key,
+    Bucket: Resource.MyBucket.name,
+  });
+  return Response.redirect(await getSignedUrl(s3, command));
+}
+```
+
+---
+
+### Test your app
+
+To upload a file run the following from your project root:
+
+```bash
+curl -F file=@package.json http://localhost:3000/
+```
+
+This should upload the `package.json`. Now head over to `http://localhost:3000/latest` in your browser and it’ll show you what you just uploaded.
+
+![SST Bun app file upload](/_astro/start-bun-app-file-upload.3Vs-WnhI_HgYJf.webp)
+
+---
+
+## 6. Deploy your app
+
+To deploy our app we’ll first add a `Dockerfile`:
+
+```dockerfile
+FROM oven/bun
+COPY bun.lock .
+COPY package.json .
+RUN bun install --frozen-lockfile
+COPY . .
+EXPOSE 3000
+CMD ["bun", "index.ts"]
+```
+
+This is a pretty basic setup. You can refer to the [Bun docs](https://bun.sh/guides/ecosystem/docker) for a more optimized Dockerfile.
+
+> **Tip:** You need to be running [Docker Desktop](https://www.docker.com/products/docker-desktop/) to deploy your app.
+
+Let’s also add a `.dockerignore` file in the root:
+
+```bash
+node_modules
+.git
+.gitignore
+README.md
+Dockerfile*
+```
+
+Now to build our Docker image and deploy we run:
+
+```bash
+bun sst deploy --stage production
+```
+
+You can use any stage name here but it’s good to create a new stage for production. This’ll give the URL of your Bun app deployed as a Fargate service.
+
+```bash
+✓  Complete
+   MyService: http://prod-MyServiceLoadBalanc-491430065.us-east-1.elb.amazonaws.com
+```
+
+Congrats! Your app should now be live!
+
+---
+
+## Connect the console
+
+As a next step, you can setup the [SST Console](/docs/console/) to **git push to deploy** your app and view logs from it.
+
+![SST Console Autodeploy](/_astro/sst-console-autodeploy.DTgdy-D4_Z1dQNdJ.webp)
+
+You can [create a free account](https://console.sst.dev) and connect it to your AWS account.
