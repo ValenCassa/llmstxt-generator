@@ -14,10 +14,19 @@ import color from "picocolors";
 import { createOpenAI } from "@ai-sdk/openai";
 import { generateObject } from "ai";
 import { z } from "zod";
+import Yargs from "yargs/yargs";
+import { hideBin } from "yargs/helpers";
 
 // --- Constants ---
 const MAX_CHUNK_SIZE = 120000;
 const CONTEXT_OVERLAP_SIZE = 5000;
+
+// --- Default Options Constants ---
+const DEFAULT_OUTPUT_DIR = "./docs";
+const DEFAULT_PROJECT_NAME = ""; // Will default to domain name later
+const DEFAULT_EXCLUDE_PATHS = "";
+const DEFAULT_SHOULD_RESTART = false;
+const DEFAULT_MAX_CONCURRENT = "2";
 
 // --- Clack Icons/Symbols ---
 const unicode = isUnicodeSupported();
@@ -41,106 +50,6 @@ const ICONS = {
 // Spinner (matching clack/prompts src/index.ts)
 const SPINNER_FRAMES = unicode ? ["◒", "◐", "◓", "◑"] : ["•", "o", "O", "0"];
 const SPINNER_DELAY = unicode ? 80 : 120;
-let spinnerFrameIndex = 0;
-let spinnerInterval = null;
-
-// --- Helper Functions ---
-
-/**
- * Normalizes a URL string by removing the hash and trailing slash.
- * @param {string} urlString The URL string to normalize.
- * @param {string} [baseUrl] Optional base URL for resolving relative URLs.
- * @returns {string} The normalized URL string, or the original string if normalization fails.
- */
-function normalizeUrl(urlString, baseUrl) {
-  try {
-    const url = new URL(urlString, baseUrl); // Use baseUrl if provided for relative URLs
-    url.hash = "";
-    let normalized = url.toString();
-    if (normalized.endsWith("/")) {
-      normalized = normalized.slice(0, -1);
-    }
-    return normalized;
-  } catch (error) {
-    // console.warn(`Failed to normalize URL: ${urlString}`, error);
-    return urlString; // Return original on error
-  }
-}
-
-function sanitize(text) {
-  if (!text) return "";
-  return text
-    .toLowerCase()
-    .replace(/\s+/g, "-")
-    .replace(/[^a-z0-9-]/g, "")
-    .replace(/--+/g, "-")
-    .replace(/^-+|-+$/g, "");
-}
-function generateFilenameFromUrl(urlString) {
-  try {
-    const url = new URL(urlString);
-    let pathSegments = url.pathname.split("/").filter((segment) => segment);
-    if (pathSegments.length === 0) {
-      return "index.md";
-    }
-    if (
-      pathSegments.length > 1 &&
-      pathSegments[pathSegments.length - 1] === "index"
-    ) {
-      pathSegments.pop();
-    }
-    const lastSegment = pathSegments[pathSegments.length - 1];
-    const sanitized = sanitize(lastSegment);
-    return sanitized ? `${sanitized}.md` : `page-${Date.now()}.md`;
-  } catch (error) {
-    // Use console.warn for non-critical issues
-    console.warn(`Could not parse URL for filename: ${urlString}`, error);
-    return `page-${Date.now()}.md`;
-  }
-}
-function cleanAndParseJson(rawText) {
-  // Simplified JSON cleaning and parsing logic
-  if (!rawText) {
-    throw new Error("Received empty response from model");
-  }
-  let cleanedText = rawText.trim();
-
-  // Remove Markdown code fences if present
-  const fenceMatch = cleanedText.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/);
-  if (fenceMatch && fenceMatch[1]) {
-    cleanedText = fenceMatch[1].trim();
-  }
-
-  // Basic check for JSON structure
-  if (!cleanedText.startsWith("{") || !cleanedText.endsWith("}")) {
-    // Attempt to find the first '{' and last '}'
-    const firstBrace = cleanedText.indexOf("{");
-    const lastBrace = cleanedText.lastIndexOf("}");
-    if (firstBrace !== -1 && lastBrace > firstBrace) {
-      cleanedText = cleanedText.substring(firstBrace, lastBrace + 1);
-    } else {
-      throw new Error(
-        "Response doesn't appear to be valid JSON (missing braces)"
-      );
-    }
-  }
-
-  try {
-    return JSON.parse(cleanedText);
-  } catch (parseError) {
-    // Log detailed error info separately for debugging
-    console.error("\n--- JSON Parsing Error ---");
-    console.error("Failed to parse JSON from model response.");
-    console.error("Parse Error:", parseError.message);
-    console.error("Cleaned text before parse:", cleanedText);
-    // console.error("Original raw text:", rawText); // Optionally log original
-    console.error("--- End JSON Parsing Error ---\n");
-    // Provide a user-friendly error message
-    throw new Error(
-      `Failed to parse JSON response (check console for details)`
-    );
-  }
-}
 
 // --- Zod Schema and Prompt ---
 const docSchema = z.object({
@@ -183,668 +92,1013 @@ const aiClient = createOpenAI({
 });
 const modelName = "gpt-4o-mini"; // Or your preferred model
 
-// --- Task State Management and Rendering ---
-let tasksState = {};
-const indexEntries = [];
-let generationStats = { success: 0, error: 0, skipped: 0 };
-let globalOptions = {};
-let globalPaths = { baseDocsDir: null, siteDocsDir: null };
-
-// --- Crawler Function (Moved from src/crawler.js) ---
+// ===========================================================================
+// DocGenerator Class
+// ===========================================================================
 /**
- * Crawls a website starting from a given URL and collects all unique sub-path URLs
- * along with their body HTML content, up to a specified limit.
- *
- * @param {string} startUrl The URL to start crawling from.
- * @param {number} [limit=Infinity] The maximum number of URLs to collect data for.
- * @param {string[]} [excludePaths=[]] An array of path prefixes to exclude.
- * @returns {Promise<Map<string, string | null>>} A Promise that resolves to a Map where keys are
- *   normalized URLs and values are the body HTML string or null if fetching failed.
+ * Handles the process of crawling a website, generating Markdown documentation
+ * from the content using an AI model, and saving the results.
  */
-async function crawlWebsite(startUrl, limit = Infinity, excludePaths = []) {
-  // IMPORTANT: Need to import playwright within this function scope
-  // because it was originally imported in the separate crawler file.
-  const playwright = await import("playwright");
-  const browser = await playwright.chromium.launch();
-  const page = await browser.newPage();
-  const collectedData = new Map();
-  const normalizedStartUrl = normalizeUrl(startUrl);
-  const queue = new Set();
-  const originUrl = new URL(normalizedStartUrl);
-  const siteOrigin = originUrl.origin;
-  const basePath =
-    originUrl.pathname === "/" ? "/" : originUrl.pathname.replace(/\/?$/, "");
+class DocGenerator {
+  /**
+   * Initializes the DocGenerator instance, setting up initial state
+   * for tasks, index entries, stats, options, paths, and UI elements.
+   */
+  constructor() {
+    // State Variables
+    /** @type {Object<string, {url: string, bodyHTML: string, filePath: string, relativePath: string, filename: string, status: 'pending'|'skipped'|'generating'|'saving'|'success'|'error', message: string, chunkInfo: string}>} */
+    this.tasksState = {};
+    /** @type {Array<{title: string, description: string, path: string}>} */
+    this.indexEntries = [];
+    /** @type {{success: number, error: number, skipped: number}} */
+    this.generationStats = { success: 0, error: 0, skipped: 0 };
+    /** @type {{baseUrl?: string, outputDir?: string, projectName?: string, limit?: number, excludePaths?: string[], shouldRegenerate?: boolean, maxConcurrent?: number}} */
+    this.options = {};
+    /** @type {{baseDocsDir: string | null, siteDocsDir: string | null}} */
+    this.paths = { baseDocsDir: null, siteDocsDir: null };
 
-  const startUrlPath = originUrl.pathname;
-  const startPathSegments = startUrlPath.split("/").filter(Boolean);
-  const isStartExcluded = excludePaths.some((exPath) => {
-    const cleanExPath = exPath.replace(/^\/+|\/+$/g, "").trim();
-    return cleanExPath && startPathSegments.includes(cleanExPath);
-  });
-
-  if (!isStartExcluded) {
-    queue.add(normalizedStartUrl);
-  } else {
-    p.log.warn(
-      `Skipping start URL ${normalizedStartUrl} as it matches exclusion rules.`
-    );
+    // UI / Concurrency State
+    /** @type {NodeJS.Timeout | null} */
+    this.spinnerInterval = null;
+    /** @type {number} */
+    this.spinnerFrameIndex = 0;
+    /** @type {Map<string, Promise<void>>} */
+    this.activePromises = new Map();
+    /** @type {number} */
+    this.taskQueueIndex = 0;
+    /** @type {boolean} */
+    this.processingFinished = false;
   }
 
-  while (queue.size > 0 && collectedData.size < limit) {
-    const currentUrlFromQueue = queue.values().next().value;
-    queue.delete(currentUrlFromQueue);
-    const currentNormalizedUrl = currentUrlFromQueue;
-
-    if (collectedData.has(currentNormalizedUrl)) {
-      continue;
-    }
-
-    let bodyHTML = null;
+  // --- Helper Methods ---
+  /**
+   * Normalizes a URL string, resolving relative paths against a base URL
+   * and removing the hash fragment. Ensures trailing slashes are removed.
+   * @param {string} urlString - The URL string to normalize.
+   * @param {string} [baseUrl] - The base URL to resolve against if urlString is relative.
+   * @returns {string} The normalized URL string.
+   * @private
+   */
+  #normalizeUrl(urlString, baseUrl) {
     try {
-      await page.goto(currentNormalizedUrl, {
-        waitUntil: "domcontentloaded",
-        timeout: 15000,
-      });
-      bodyHTML = await page.evaluate(() => document.body?.innerHTML ?? "");
+      const url = new URL(urlString, baseUrl);
+      url.hash = "";
+      let normalized = url.toString();
+      if (normalized.endsWith("/")) {
+        normalized = normalized.slice(0, -1);
+      }
+      return normalized;
+    } catch (error) {
+      return urlString;
+    }
+  }
 
-      if (collectedData.size + 1 < limit) {
-        const links = await page.evaluate(() =>
-          Array.from(
-            document.querySelectorAll("a[href]"),
-            (a) => /** @type {HTMLAnchorElement} */ (a).href
-          )
-        );
-        for (const link of links) {
-          const discoveredNormalizedUrl = normalizeUrl(
-            link,
-            currentNormalizedUrl
-          );
-          try {
-            const discoveredUrlObject = new URL(discoveredNormalizedUrl);
-            const discoveredPath = discoveredUrlObject.pathname;
-            const pathSegments = discoveredPath.split("/").filter(Boolean);
+  /**
+   * Sanitizes text for use in filenames by converting to lowercase,
+   * replacing whitespace with hyphens, removing invalid characters,
+   * and cleaning up hyphens.
+   * @param {string} text - The text to sanitize.
+   * @returns {string} The sanitized text.
+   * @private
+   */
+  #sanitize(text) {
+    if (!text) return "";
+    return text
+      .toLowerCase()
+      .replace(/\s+/g, "-")
+      .replace(/[^a-z0-9-]/g, "")
+      .replace(/--+/g, "-")
+      .replace(/^-+|-+$/g, "");
+  }
 
-            const isExcluded = excludePaths.some((exPath) => {
-              const cleanExPath = exPath.replace(/^\/+|\/+$/g, "").trim();
-              return cleanExPath && pathSegments.includes(cleanExPath);
-            });
+  /**
+   * Generates a safe filename (e.g., "page-name.md") from a URL string.
+   * Uses the last path segment, sanitized. Defaults to "index.md" for root paths
+   * or a timestamped name if sanitization fails.
+   * @param {string} urlString - The URL to generate a filename from.
+   * @param {string[]} [basePathSegments=[]] - Path segments of the start URL to potentially remove.
+   * @returns {string} The generated markdown filename.
+   * @private
+   */
+  #generateFilenameFromUrl(urlString, basePathSegments = []) {
+    try {
+      const url = new URL(urlString);
+      // Get all path segments, filter out empty ones
+      const pathSegments = url.pathname.split("/").filter(Boolean);
 
-            if (
-              discoveredUrlObject.origin === siteOrigin &&
-              discoveredPath.startsWith(basePath) &&
-              !isExcluded &&
-              !collectedData.has(discoveredNormalizedUrl) &&
-              !queue.has(discoveredNormalizedUrl) &&
-              queue.size + collectedData.size + 1 < limit + 10
-            ) {
-              queue.add(discoveredNormalizedUrl);
-            } else if (isExcluded) {
-              // p.log.warn(`Skipping excluded path: ${discoveredNormalizedUrl}`); // Optional: Can be noisy
-            }
-          } catch (urlError) {
-            /* Ignore invalid URLs */
+      // Check if current path starts with base path segments
+      let segmentsToUse = [...pathSegments]; // Clone
+      if (
+        basePathSegments.length > 0 &&
+        segmentsToUse.length >= basePathSegments.length
+      ) {
+        let match = true;
+        for (let i = 0; i < basePathSegments.length; i++) {
+          if (segmentsToUse[i] !== basePathSegments[i]) {
+            match = false;
+            break;
           }
         }
+        if (match) {
+          // Remove the base segments from the start
+          segmentsToUse.splice(0, basePathSegments.length);
+        }
       }
+
+      // 3. If removing the prefix left nothing, it's an index under the base
+      if (segmentsToUse.length === 0) {
+        // CHANGE: Don't return "index.md" for content pages.
+        // Use a distinct name like "_index.md" to avoid conflict with the generated index list.
+        return "_index.md";
+      }
+
+      // 4. Otherwise, join remaining segments
+      const joinedSegments = segmentsToUse.join("-");
+
+      // Sanitize the entire joined string
+      const sanitized = this.#sanitize(joinedSegments);
+
+      // Return sanitized name or fallback with timestamp
+      return sanitized ? `${sanitized}.md` : `page-${Date.now()}.md`;
     } catch (error) {
-      const errorMessage =
-        error instanceof Error ? error.message : String(error);
-      if (errorMessage.includes("Navigation timeout")) {
-        p.log.error(`Timeout visiting ${currentNormalizedUrl}. Skipping.`);
-      } else if (errorMessage.includes("net::ERR_")) {
-        p.log.error(
-          `Network error visiting ${currentNormalizedUrl}: ${errorMessage}. Skipping.`
+      console.warn(`Could not parse URL: ${urlString}`, error);
+      return `page-${Date.now()}.md`;
+    }
+  }
+
+  // --- Core Logic Methods ---
+  /**
+   * Crawls a website starting from a given URL, respecting limits and exclusions.
+   * Uses Playwright to fetch and parse pages.
+   * @param {string} baseUrl - The initial URL to begin crawling.
+   * @param {string[]} [excludePaths=[]] - Array of path segments to exclude.
+   * @returns {Promise<Map<string, string|null>>} A Map where keys are normalized URLs and values are the body HTML content (or null on error).
+   * @private
+   */
+  async #crawlWebsite(baseUrl, excludePaths = []) {
+    const playwright = await import("playwright");
+    const browser = await playwright.chromium.launch();
+    const page = await browser.newPage();
+    const collectedData = new Map();
+    const normalizedBaseUrl = this.#normalizeUrl(baseUrl);
+    const queue = new Set();
+    const originUrl = new URL(normalizedBaseUrl);
+    const siteOrigin = originUrl.origin;
+    const basePath =
+      originUrl.pathname === "/" ? "/" : originUrl.pathname.replace(/\/?$/, "");
+    const startUrlPath = originUrl.pathname;
+    const startPathSegments = startUrlPath.split("/").filter(Boolean);
+    const isStartExcluded = excludePaths.some((ex) => {
+      const clean = ex.replace(/^\/+|\/+$/g, "").trim();
+      return clean && startPathSegments.includes(clean);
+    });
+    if (!isStartExcluded) queue.add(normalizedBaseUrl);
+    else p.log.warn(`Skipping base URL ${normalizedBaseUrl} (excluded).`);
+
+    while (queue.size > 0) {
+      const currentUrl = queue.values().next().value;
+      queue.delete(currentUrl);
+      if (collectedData.has(currentUrl)) continue;
+      let bodyHTML = null;
+      try {
+        await page.goto(currentUrl, {
+          waitUntil: "domcontentloaded",
+          timeout: 15000,
+        });
+        bodyHTML = await page.evaluate(() => document.body?.innerHTML ?? "");
+        const links = await page.evaluate(() =>
+          Array.from(document.querySelectorAll("a[href]"), (a) => a.href)
         );
-      } else {
-        p.log.error(`Error crawling ${currentNormalizedUrl}: ${errorMessage}`);
-      }
-    }
-    collectedData.set(currentNormalizedUrl, bodyHTML);
-  }
-
-  await browser.close();
-  return collectedData;
-}
-
-// --- Function Definitions --- (renderTaskList remains)
-function renderTaskList(currentState = tasksState) {
-  // Default to global if not passed
-  const lines = [];
-  const sortedPaths = Object.keys(currentState).sort();
-
-  // Use finalGenStats for the header if available (or global if called during run)
-  const stats =
-    typeof finalGenStats !== "undefined" ? finalGenStats : generationStats;
-
-  for (const relativePath of sortedPaths) {
-    const task = currentState[relativePath];
-    let statusText = task.status;
-    let statusColor = color.gray;
-    let icon = " ";
-
-    switch (task.status) {
-      case "pending":
-        statusText = "Pending";
-        icon = ICONS.PENDING;
-        break;
-      case "skipped":
-        statusText = "Skipped";
-        statusColor = color.yellow;
-        icon = ICONS.SKIPPED;
-        break;
-      case "generating":
-        statusText = `Generating ${task.chunkInfo || ""}`.trim();
-        statusColor = color.cyan;
-        icon = SPINNER_FRAMES[spinnerFrameIndex]; // Use current spinner frame
-        break;
-      case "saving":
-        statusText = "Saving...";
-        statusColor = color.cyan;
-        icon = ICONS.SAVING;
-        break;
-      case "success":
-        statusText = "Success";
-        statusColor = color.green;
-        icon = ICONS.SUCCESS;
-        break;
-      case "error":
-        statusText = "Error";
-        statusColor = color.red;
-        icon = ICONS.ERROR;
-        break;
-    }
-
-    const paddedStatus = `[${statusText}]`.padEnd(25);
-    let line = ` ${statusColor(icon)} ${statusColor(paddedStatus)} ${color.dim(
-      relativePath
-    )}`;
-    if (task.status === "error" && task.message) {
-      line += ` - ${color.red(task.message.slice(0, 70))}`;
-    }
-    lines.push(line);
-  }
-  return lines.join("\n");
-}
-
-// --- Main Application Logic ---
-async function main() {
-  // Add SIGINT Handler near the start
-  process.on("SIGINT", () => {
-    if (spinnerInterval) clearInterval(spinnerInterval);
-    // Attempt to clean up logUpdate - might not be perfect on abrupt exit
-    try {
-      if (typeof logUpdate.done === "function") {
-        logUpdate.done();
-      } else if (logUpdate.clear) {
-        logUpdate.clear();
-      }
-    } catch {}
-    p.cancel("Operation cancelled by user.");
-    process.exit(130); // Standard exit code for Ctrl+C
-  });
-
-  console.clear();
-  p.intro(color.inverse(" Docs Crawler & Generator 🚀 "));
-
-  // --- 1. Get Options using Clack ---
-  const options = await p.group(
-    {
-      startUrl: () =>
-        p.text({
-          message: "Enter the starting URL:",
-          placeholder: "https://docs.example.com",
-          validate: (v) => {
-            if (!v) return "URL required";
-            try {
-              new URL(v);
-            } catch {
-              return "Invalid URL";
+        for (const link of links) {
+          const normLink = this.#normalizeUrl(link, currentUrl);
+          try {
+            const linkUrl = new URL(normLink);
+            const linkPath = linkUrl.pathname;
+            const segments = linkPath.split("/").filter(Boolean);
+            const excluded = excludePaths.some((ex) => {
+              const clean = ex.replace(/^\/+|\/+$/g, "").trim();
+              return clean && segments.includes(clean);
+            });
+            if (
+              linkUrl.origin === siteOrigin &&
+              linkPath.startsWith(basePath) &&
+              !excluded &&
+              !collectedData.has(normLink) &&
+              !queue.has(normLink) &&
+              queue.size + collectedData.size + 1 < collectedData.size + 20
+            ) {
+              queue.add(normLink);
             }
-            return undefined;
-          },
-        }),
-      outputDir: () =>
-        p.text({ message: "Output directory:", initialValue: "./docs" }),
-      projectName: () =>
-        p.text({
-          message: "Project folder name (optional, uses domain if blank):",
-          initialValue: "",
-        }),
-      limit: () =>
-        p.text({
-          message: "URL limit (blank for none):",
-          initialValue: "",
-          validate: (v) =>
-            !v || (Number.isInteger(+v) && +v > 0)
-              ? undefined
-              : "Must be a positive integer",
-        }),
-      excludePaths: () =>
-        p.text({
-          message: "Exclude paths? (Comma-separated, e.g., /api,/examples):",
-          placeholder: "No exclusions",
-          initialValue: "",
-        }),
-      shouldRestart: () =>
-        p.confirm({
-          message: "Overwrite existing files?",
-          initialValue: false,
-        }),
-      maxConcurrent: () =>
-        p.text({
-          message: "Max concurrent requests:",
-          initialValue: "2",
-          validate: (v) =>
-            v && Number.isInteger(+v) && +v > 0
-              ? undefined
-              : "Must be a positive integer",
-        }),
-    },
-    {
-      onCancel: () => {
-        p.cancel("Operation cancelled.");
-        process.exit(0);
-      },
-    }
-  );
-
-  // Parse and store options globally
-  const rawExcludePaths = options.excludePaths || "";
-  globalOptions = {
-    startUrl: options.startUrl,
-    outputDir: options.outputDir || "./docs",
-    projectName: options.projectName,
-    limit: options.limit ? parseInt(options.limit, 10) : Infinity,
-    // Parse the excludePaths string into an array, trimming whitespace
-    excludePaths: rawExcludePaths
-      .split(",")
-      .map((p) => p.trim())
-      .filter((p) => p.length > 0),
-    shouldRestart: options.shouldRestart,
-    maxConcurrent: parseInt(options.maxConcurrent || "10", 10),
-  };
-
-  // --- 2. Crawl Website ---
-  const s = p.spinner();
-  s.start(`Crawling from ${globalOptions.startUrl}...`);
-  let dataMap;
-  try {
-    dataMap = await crawlWebsite(
-      globalOptions.startUrl,
-      globalOptions.limit,
-      globalOptions.excludePaths
-    );
-    s.stop(`Crawling complete. Found ${dataMap?.size || 0} pages.`);
-  } catch (e) {
-    s.stop("Crawling failed.");
-    p.log.error(`Crawling error: ${e.message}`);
-    process.exit(1);
-  }
-
-  if (!dataMap || dataMap.size === 0) {
-    p.log.warn("Crawl finished but received no data.");
-    process.exit(0);
-  }
-
-  // --- 3. Prepare Tasks and Directories ---
-  p.log.step("Preparing tasks and directories...");
-  let domainName = globalOptions.projectName
-    ? sanitize(globalOptions.projectName)
-    : "";
-  if (!domainName) {
-    try {
-      domainName = new URL(globalOptions.startUrl).hostname.replace(
-        /^www\./,
-        ""
-      );
-    } catch {
-      domainName = "unknown-site";
-    }
-  }
-  globalPaths.baseDocsDir = path.resolve(
-    process.cwd(),
-    globalOptions.outputDir
-  );
-  globalPaths.siteDocsDir = path.join(globalPaths.baseDocsDir, domainName);
-  try {
-    await fsp.mkdir(globalPaths.siteDocsDir, { recursive: true });
-    p.log.info(`Output directory set to: ${globalPaths.siteDocsDir}`);
-  } catch (e) {
-    p.log.error(`Failed to create directory: ${e.message}`);
-    console.error("\n--- Directory Creation Error ---\n", e, "\n---");
-    process.exit(1);
-  }
-
-  // Initialize tasksState and filter tasks to run
-  const tasksToRun = []; // Array of relativePaths for tasks needing processing
-  tasksState = {}; // Reset state
-  generationStats = { success: 0, error: 0, skipped: 0 }; // Reset stats
-  indexEntries.length = 0; // Clear previous index entries
-
-  for (const [url, bodyHTML] of dataMap.entries()) {
-    if (!bodyHTML) continue; // Skip pages with no content
-    const filename = generateFilenameFromUrl(url);
-    const filePath = path.join(globalPaths.siteDocsDir, filename);
-    const relativePath = path.relative(globalPaths.baseDocsDir, filePath);
-
-    // Initialize state for ALL potential tasks (for the list view)
-    tasksState[relativePath] = {
-      url,
-      bodyHTML,
-      filePath,
-      relativePath,
-      filename,
-      status: "pending",
-      message: "",
-      chunkInfo: "",
-    };
-
-    // Check if task should be skipped
-    if (!globalOptions.shouldRestart && fs.existsSync(filePath)) {
-      tasksState[relativePath].status = "skipped";
-      generationStats.skipped++;
-      indexEntries.push({
-        title: filename.replace(".md", ""),
-        description: "(Skipped - File Exists)",
-        path: relativePath,
-      });
-    } else {
-      // Add to the queue of tasks that actually need processing
-      tasksToRun.push(relativePath);
-    }
-  }
-
-  if (tasksToRun.length === 0) {
-    p.log.warn(
-      "No new documentation pages to generate (all skipped or empty)."
-    );
-    logUpdate(renderTaskList()); // Show the final list (all skipped/pending)
-    logUpdate.done();
-    p.outro("✅ Processing complete (no new files generated).");
-    process.exit(0);
-  }
-
-  p.log.step(
-    `Starting generation for ${tasksToRun.length} pages (Concurrency: ${globalOptions.maxConcurrent})...`
-  );
-
-  // --- 4. Run Generation Tasks Concurrently using log-update ---
-  // Start the spinner animation interval *before* the first render
-  if (!spinnerInterval) {
-    spinnerInterval = setInterval(() => {
-      spinnerFrameIndex = (spinnerFrameIndex + 1) % SPINNER_FRAMES.length;
-      // Re-render only if there are active tasks (avoids rendering spinner after completion)
-      if (activePromises.size > 0 || taskQueueIndex < tasksToRun.length) {
-        logUpdate(renderTaskList());
+          } catch {
+            /* ignore invalid links */
+          }
+        }
+      } catch (e) {
+        const msg = e.message;
+        if (msg.includes("timeout")) p.log.error(`Timeout: ${currentUrl}`);
+        else if (msg.includes("net::ERR"))
+          p.log.error(`Network Error: ${currentUrl}`);
+        else p.log.error(`Crawl Error: ${currentUrl}: ${msg}`);
       }
-    }, SPINNER_DELAY);
+      collectedData.set(currentUrl, bodyHTML);
+    }
+    await browser.close();
+    return collectedData;
   }
 
-  logUpdate(renderTaskList()); // Initial render of the full task list
+  /**
+   * Renders the current state of all tasks into a string suitable for display.
+   * Includes status icons, colors, padding, and error messages.
+   * Uses the current spinner frame for 'generating' tasks.
+   * @returns {string} A multi-line string representing the task list.
+   * @private
+   */
+  #renderFullTaskList() {
+    const lines = [];
+    const sortedPaths = Object.keys(this.tasksState).sort();
+    for (const relativePath of sortedPaths) {
+      const task = this.tasksState[relativePath];
+      let statusText = task.status;
+      let statusColor = color.gray;
+      let icon = " ";
+      switch (task.status) {
+        case "pending":
+          statusText = "Pending";
+          icon = ICONS.PENDING;
+          break;
+        case "skipped":
+          statusText = "Skipped";
+          statusColor = color.yellow;
+          icon = ICONS.SKIPPED;
+          break;
+        case "generating":
+          statusText = `Generating ${task.chunkInfo || ""}`.trim();
+          statusColor = color.cyan;
+          icon = SPINNER_FRAMES[this.spinnerFrameIndex];
+          break;
+        case "saving":
+          statusText = "Saving...";
+          statusColor = color.cyan;
+          icon = ICONS.SAVING;
+          break;
+        case "success":
+          statusText = "Success";
+          statusColor = color.green;
+          icon = ICONS.SUCCESS;
+          break;
+        case "error":
+          statusText = "Error";
+          statusColor = color.red;
+          icon = ICONS.ERROR;
+          break;
+      }
+      const padded = `[${statusText}]`.padEnd(25);
+      let line = `   ${statusColor(icon)} ${statusColor(padded)} ${color.dim(
+        relativePath
+      )}`;
+      if (task.status === "error" && task.message)
+        line += ` - ${color.red(task.message.slice(0, 70))}`;
+      lines.push(line);
+    }
+    return lines.join("\n");
+  }
 
-  const activePromises = new Map();
-  let taskQueueIndex = 0;
-  let processingFinished = false; // Flag to prevent multiple calls to finishProcessing
+  /**
+   * Renders a concise progress update for log-update, showing active tasks and counts.
+   * @returns {string} A multi-line string with summary and active tasks.
+   * @private
+   */
+  #renderProgressUpdate() {
+    let generatingCount = 0;
+    let savingCount = 0;
+    let pendingCount = 0;
+    let successCount = this.generationStats.success; // Start with existing/already completed
+    let errorCount = this.generationStats.error;
 
-  const processTask = async (relativePath) => {
-    const taskData = tasksState[relativePath];
+    const activeTaskLines = [];
+    const sortedPaths = Object.keys(this.tasksState).sort();
+
+    for (const relativePath of sortedPaths) {
+      const task = this.tasksState[relativePath];
+      let line = null;
+
+      switch (task.status) {
+        case "generating":
+          generatingCount++;
+          // Format line for active task
+          line = `   ${color.cyan(
+            SPINNER_FRAMES[this.spinnerFrameIndex]
+          )} ${color.cyan(
+            `[Generating ${task.chunkInfo || ""}]`.padEnd(25)
+          )} ${color.dim(relativePath)}`;
+          break;
+        case "saving":
+          savingCount++;
+          // Format line for active task
+          line = `   ${color.cyan(ICONS.SAVING)} ${color.cyan(
+            "[Saving...]".padEnd(25)
+          )} ${color.dim(relativePath)}`;
+          break;
+        case "pending":
+          pendingCount++;
+          break;
+        // We use generationStats for final success/error counts, but need to account for non-finished ones if needed.
+        // For now, assume generationStats covers completed tasks correctly.
+      }
+      if (line) activeTaskLines.push(line);
+    }
+
+    // Adjust counts if generationStats is not live (it seems to be updated *after* task finishes)
+    // Recalculate success/error by iterating if needed for live view - simpler for now:
+    successCount = this.generationStats.success;
+    errorCount = this.generationStats.error;
+
+    // Build summary string with indentation and colors
+    const summary = `   ${color.cyan(
+      `Active: ${generatingCount + savingCount}`
+    )} ${color.dim("|")} ${color.gray(`Pending: ${pendingCount}`)} ${color.dim(
+      "|"
+    )} ${color.green(`Success: ${successCount}`)} ${color.dim("|")} ${color.red(
+      `Error: ${errorCount}`
+    )}`;
+
+    // Combine summary and active tasks
+    return `${summary}\n${activeTaskLines.join("\n")}`;
+  }
+
+  /**
+   * Processes a single task: generates markdown from HTML content using AI,
+   * handles chunking for large content, saves the markdown to a file,
+   * and updates task status and stats. Updates UI via logUpdate.
+   * @param {string} relativePath - The relative path identifying the task in `tasksState`.
+   * @returns {Promise<void>}
+   * @private
+   */
+  #processTask = async (relativePath) => {
+    const taskData = this.tasksState[relativePath];
     taskData.status = "generating";
     taskData.message = "Starting...";
     taskData.chunkInfo = "";
-    logUpdate(renderTaskList()); // Update UI: Task is generating
-
-    let finalTitle = taskData.filename.replace(".md", ""); // Default title
+    logUpdate(`\n${this.#renderProgressUpdate()}\n`);
+    let finalTitle = taskData.filename.replace(".md", "");
     let finalDescription = "";
     let combinedMarkdown = "";
-
     try {
       const needsChunking = taskData.bodyHTML.length > MAX_CHUNK_SIZE;
       if (needsChunking) {
-        // --- Chunking Logic ---
         taskData.chunkInfo = "Chunking...";
-        logUpdate(renderTaskList());
+        logUpdate(`\n${this.#renderProgressUpdate()}\n`);
         const chunks = [];
         let currentIndex = 0;
-        const breakWindow = 500; // How far back to look for sentence breaks
+        const breakWindow = 500;
         while (currentIndex < taskData.bodyHTML.length) {
           let end = Math.min(
             currentIndex + MAX_CHUNK_SIZE,
             taskData.bodyHTML.length
           );
-          // Try to find a better break point if not at the very end
           if (end < taskData.bodyHTML.length) {
-            let bestBreakPoint = -1;
+            let bestBreak = -1;
             const searchStart = Math.max(currentIndex, end - breakWindow);
-            // Prefer line breaks or sentence endings
-            const sentenceEndings = [
-              ". ",
-              ".\\n",
-              "! ",
-              "!\\n",
-              "? ",
-              "?\\n",
-              "\\n",
-            ];
-            for (const ending of sentenceEndings) {
-              const breakPoint = taskData.bodyHTML.lastIndexOf(ending, end - 1);
-              if (breakPoint !== -1 && breakPoint >= searchStart) {
-                bestBreakPoint = Math.max(
-                  bestBreakPoint,
-                  breakPoint + ending.length
-                );
-              }
+            const endings = [". ", ".\n", "! ", "!\n", "? ", "?\n", "\n"];
+            for (const ending of endings) {
+              const pt = taskData.bodyHTML.lastIndexOf(ending, end - 1);
+              if (pt !== -1 && pt >= searchStart)
+                bestBreak = Math.max(bestBreak, pt + ending.length);
             }
-            // If a good break point was found, use it
-            if (bestBreakPoint !== -1 && bestBreakPoint > currentIndex) {
-              end = bestBreakPoint;
-            }
+            if (bestBreak !== -1 && bestBreak > currentIndex) end = bestBreak;
           }
           chunks.push(taskData.bodyHTML.substring(currentIndex, end));
           currentIndex = end;
         }
-        // --- End Chunking Logic ---
-
-        let previousChunkContent = null;
+        let prevContent = null;
         for (let i = 0; i < chunks.length; i++) {
           taskData.chunkInfo = `Chunk ${i + 1}/${chunks.length}`;
-          taskData.status = "generating"; // Keep status as generating
-          logUpdate(renderTaskList());
-
-          const currentChunk = chunks[i];
-          let promptInputHtml = "";
-          // Add overlap context if not the first chunk
-          if (i > 0 && previousChunkContent) {
-            const overlapStartIndex = Math.max(
+          logUpdate(`\n${this.#renderProgressUpdate()}\n`);
+          let inputHtml = chunks[i];
+          if (i > 0 && prevContent) {
+            const overlap = Math.max(
               0,
-              previousChunkContent.length - CONTEXT_OVERLAP_SIZE
+              prevContent.length - CONTEXT_OVERLAP_SIZE
             );
-            const overlapContext =
-              previousChunkContent.substring(overlapStartIndex);
-            promptInputHtml = `${overlapContext}\\n\\n--- Overlap End / Current Chunk Start ---\\n\\n${currentChunk}`;
-          } else {
-            promptInputHtml = currentChunk;
+            inputHtml = `${prevContent.substring(
+              overlap
+            )}\n\n--- Overlap End / Current Chunk Start ---\n\n${chunks[i]}`;
           }
-
-          // Call AI for the chunk
           const { object: chunkDoc } = await generateObject({
             model: aiClient(modelName),
             schema: docSchema,
-            prompt: `${generationPrompt}\\n\\n${promptInputHtml}`,
+            prompt: `${generationPrompt}\n\n${inputHtml}`,
           });
-
-          // Use title/desc from the first chunk only
           if (i === 0) {
             finalTitle = chunkDoc.title;
             finalDescription = chunkDoc.description;
           }
-          // Append markdown content, adding separators
-          combinedMarkdown +=
-            (i > 0 ? "\\n\\n" : "") + chunkDoc.markdownContent;
-          previousChunkContent = currentChunk; // Store for next overlap
+          combinedMarkdown += (i > 0 ? "\n\n" : "") + chunkDoc.markdownContent;
+          prevContent = chunks[i];
         }
       } else {
-        // --- Single Chunk Processing ---
         taskData.chunkInfo = "single chunk";
-        logUpdate(renderTaskList());
+        logUpdate(`\n${this.#renderProgressUpdate()}\n`);
         const { object: doc } = await generateObject({
           model: aiClient(modelName),
           schema: docSchema,
-          prompt: `${generationPrompt}\\n\\n${taskData.bodyHTML}`,
+          prompt: `${generationPrompt}\n\n${taskData.bodyHTML}`,
         });
         finalTitle = doc.title;
         finalDescription = doc.description;
         combinedMarkdown = doc.markdownContent;
       }
-
-      // --- Saving File ---
       taskData.status = "saving";
-      taskData.chunkInfo = ""; // Clear chunk info
-      logUpdate(renderTaskList());
+      taskData.chunkInfo = "";
+      logUpdate(`\n${this.#renderProgressUpdate()}\n`);
       await fsp.writeFile(taskData.filePath, combinedMarkdown);
-
-      // --- Success ---
       taskData.status = "success";
       taskData.message = "";
-      indexEntries.push({
+      // Store workspace-relative path for the index
+      const workspaceRelativePath = path.relative(
+        process.cwd(),
+        taskData.filePath
+      );
+      this.indexEntries.push({
         title: finalTitle,
         description: finalDescription,
-        path: relativePath,
+        path: workspaceRelativePath, // Use workspace-relative path
       });
-      generationStats.success++;
+      this.generationStats.success++;
     } catch (err) {
-      // --- Error Handling ---
       const errorMsg = err instanceof Error ? err.message : String(err);
-      // Log full error details separately, not in the updating list
       console.error(`\n--- Task Error: ${relativePath} ---\n`, err, "\n---");
       taskData.status = "error";
-      taskData.message = errorMsg; // Store truncated message for UI
-      indexEntries.push({
+      taskData.message = errorMsg;
+      // Store workspace-relative path even for errors, if possible
+      const workspaceRelativePathOnError = path.relative(
+        process.cwd(),
+        taskData.filePath
+      );
+      this.indexEntries.push({
         title: taskData.filename,
         description: `(Failed: ${errorMsg.slice(0, 50)}...)`,
-        path: relativePath + ".error",
+        path: workspaceRelativePathOnError + ".error", // Use workspace-relative path
       });
-      generationStats.error++;
+      this.generationStats.error++;
     } finally {
-      logUpdate(renderTaskList()); // Ensure final status update for this task
+      logUpdate(`\n${this.#renderProgressUpdate()}\n`);
     }
   };
 
-  const runNext = () => {
-    // Check for completion FIRST - if queue empty and no active tasks, we are done.
-    if (taskQueueIndex >= tasksToRun.length && activePromises.size === 0) {
-      if (!processingFinished) {
-        // Prevent multiple calls
-        processingFinished = true;
-        // Pass state to finishProcessing
-        setTimeout(
-          () =>
-            finishProcessing(
-              tasksState,
-              indexEntries,
-              generationStats,
-              globalOptions,
-              globalPaths
-            ),
-          50
-        );
-      }
-      return; // Stop queuing
-    }
-
-    // While there are tasks left in the queue AND we have capacity
-    while (
-      taskQueueIndex < tasksToRun.length &&
-      activePromises.size < globalOptions.maxConcurrent
+  /**
+   * Runs the next available task from the queue if concurrency limits allow.
+   * If the queue is finished and no tasks are active, calls #finishProcessing.
+   * This method is called recursively within promise chains to ensure continuous processing.
+   * @private
+   */
+  #runNext = () => {
+    if (
+      this.taskQueueIndex >= this.tasksToRun.length &&
+      this.activePromises.size === 0
     ) {
-      const relativePath = tasksToRun[taskQueueIndex++];
-      const promise = processTask(relativePath).finally(() => {
-        activePromises.delete(relativePath); // Remove from active set
-        runNext(); // Check for completion and queue next task
-      });
-      activePromises.set(relativePath, promise); // Add to active set
+      if (!this.processingFinished) {
+        this.processingFinished = true;
+        setTimeout(this.#finishProcessing, 50);
+      }
+      return;
     }
-    // If the queue is now empty, but tasks are still running, we just wait for finally() to call runNext() again.
+    while (
+      this.taskQueueIndex < this.tasksToRun.length &&
+      this.activePromises.size < this.options.maxConcurrent
+    ) {
+      const relativePath = this.tasksToRun[this.taskQueueIndex++];
+      const promise = this.#processTask(relativePath).finally(() => {
+        this.activePromises.delete(relativePath);
+        this.#runNext(); // Try to run the next one
+      });
+      this.activePromises.set(relativePath, promise);
+    }
   };
 
-  // Start the initial batch of tasks
-  runNext();
-}
+  /**
+   * Generates the Markdown content for the index.md file based on the
+   * current state of indexEntries and tasksState. Includes header,
+   * placeholders for existing files, sorting, and formatting.
+   * @returns {string} The complete Markdown content for the index file.
+   * @private
+   */
+  #generateIndexContent() {
+    if (!this.paths.siteDocsDir || !this.options.baseUrl) {
+      p.log.warn(
+        "Cannot generate index content: Missing site directory or base URL."
+      );
+      return ""; // Return empty string or handle error appropriately
+    }
+    const projectName = path.basename(this.paths.siteDocsDir);
+    let content = `# Documentation Index for ${projectName}\n\nGenerated from ${this.options.baseUrl}\n\n`;
 
-// --- Final Processing Steps (called after all tasks complete) ---
-async function finishProcessing(
-  finalTasksState,
-  finalIndexEntries,
-  finalGenStats,
-  finalOptions,
-  finalPaths
-) {
-  // Clear spinner interval if somehow still running
-  if (spinnerInterval) {
-    clearInterval(spinnerInterval);
-    spinnerInterval = null;
-  }
+    // Add entries for existing files that were marked as success but didn't go through #processTask
+    // Ensure we don't add duplicates if an existing file was somehow processed
+    const processedPaths = new Set(this.indexEntries.map((e) => e.path));
+    const entriesToAdd = [...this.indexEntries]; // Start with AI-generated/error entries
 
-  logUpdate(renderTaskList(finalTasksState)); // Pass state to render function (needs update)
-
-  if (typeof logUpdate.done === "function") {
-    logUpdate.done();
-  } else if (logUpdate.clear) {
-    logUpdate.clear();
-  }
-
-  p.log.step("All generation tasks finished.");
-
-  // --- 5. Generate index.md ---
-  if (finalIndexEntries.length > 0) {
-    p.log.step("Generating index file...");
-    // Ensure paths are available
-    if (!finalPaths.siteDocsDir || !finalPaths.baseDocsDir) {
-      p.log.error("Cannot generate index: Output paths are not defined.");
-    } else {
-      const indexFilePath = path.join(finalPaths.siteDocsDir, "index.md");
-      const projectName = path.basename(finalPaths.siteDocsDir);
-
-      let indexContent = `# Documentation Index for ${projectName}\n\n`;
-      indexContent += `Generated from ${finalOptions.startUrl}\n\n`;
-      // Sort entries before writing
-      finalIndexEntries.sort((a, b) => a.path.localeCompare(b.path));
-      indexContent += finalIndexEntries
-        .map(
-          (entry) =>
-            `- ${entry.title}\n  - Path: ${entry.path}\n  - Description: ${entry.description}`
-        )
-        .join("\n\n");
-
-      try {
-        await fsp.writeFile(indexFilePath, indexContent);
-        p.log.success(
-          `Index file generated: ${path.relative(
-            finalPaths.baseDocsDir,
-            indexFilePath
-          )}`
-        );
-      } catch (indexError) {
-        p.log.error(`Error writing index file: ${indexError.message}`);
-        console.error("\n--- Index Writing Error ---\n", indexError, "\n---");
+    for (const relativePath in this.tasksState) {
+      const task = this.tasksState[relativePath];
+      // Add entries for files marked 'success' initially (existing files)
+      // or tasks that completed successfully but might not have added their entry yet if interrupted.
+      // Calculate workspace-relative path here to use for checks
+      const workspaceRelativePath = path.relative(process.cwd(), task.filePath);
+      if (
+        task.status === "success" &&
+        !processedPaths.has(workspaceRelativePath)
+      ) {
+        // Avoid adding duplicates if entry already exists for some reason
+        // Compare workspace-relative paths here too
+        if (!entriesToAdd.some((e) => e.path === workspaceRelativePath)) {
+          entriesToAdd.push({
+            // Use filename from task data, might be more reliable than regenerating
+            title: task.filename.replace(".md", ""),
+            description: "(Existing File)", // Mark clearly
+            path: workspaceRelativePath, // Use workspace-relative path
+          });
+        }
       }
     }
-  } else {
-    p.log.info(
-      "No index entries were generated (all pages might have been skipped or failed)."
-    );
+
+    // Sort all collected entries (original + existing placeholders)
+    entriesToAdd.sort((a, b) => a.path.localeCompare(b.path));
+
+    // Format the sorted entries
+    content += entriesToAdd
+      .map(
+        (e) =>
+          `- ${e.title}\n  - Path to file: ${e.path}\n  - Description: ${e.description}`
+      )
+      .join("\n\n");
+
+    return content;
   }
 
-  p.outro(
-    color.green(
-      `✅ Processing Complete! Success: ${finalGenStats.success}, Failed: ${finalGenStats.error}, Skipped: ${finalGenStats.skipped}`
-    )
-  );
+  /**
+   * Finalizes the generation process after all tasks are complete.
+   * Stops the spinner, performs a final render, generates the index.md file,
+   * and logs the final statistics.
+   * @returns {Promise<void>}
+   * @private
+   */
+  #finishProcessing = async () => {
+    if (this.spinnerInterval) {
+      clearInterval(this.spinnerInterval);
+      this.spinnerInterval = null;
+    }
+    logUpdate(`\n${this.#renderProgressUpdate()}\n`);
+    if (typeof logUpdate.done === "function") logUpdate.done();
+    else if (logUpdate.clear) logUpdate.clear();
+
+    // Print the full final list here
+    console.log(this.#renderFullTaskList());
+
+    p.log.step("All generation tasks finished.");
+    if (this.indexEntries.length > 0) {
+      p.log.step("Generating index file...");
+      if (!this.paths.siteDocsDir || !this.paths.baseDocsDir)
+        p.log.error("Cannot generate index: Output paths missing.");
+      else {
+        const indexFilePath = path.join(this.paths.siteDocsDir, "index.md");
+
+        if (this.options.shouldRegenerate) {
+          // --- Regenerate Mode: Overwrite the entire index ---
+          const indexContent = this.#generateIndexContent(); // Generate full index content
+          if (indexContent) {
+            try {
+              await fsp.writeFile(indexFilePath, indexContent); // Overwrite file
+              p.log.success(
+                `Index file regenerated: ${path.relative(
+                  this.paths.baseDocsDir,
+                  indexFilePath
+                )}`
+              );
+            } catch (e) {
+              p.log.error(`Index overwrite error: ${e.message}`);
+              console.error("\n--- Index Overwrite Error ---\n", e, "\n---");
+            }
+          } else {
+            p.log.warn(
+              "Index content generation failed or returned empty (Regenerate Mode)."
+            );
+          }
+        } else {
+          // --- Append Mode: Add only new entries to the existing index ---
+          if (this.indexEntries.length > 0) {
+            // Format only the new entries generated in this run
+            const newEntriesContent = this.indexEntries
+              .map(
+                (e) =>
+                  `- ${e.title}\n  - Path to file: ${e.path}\n  - Description: ${e.description}`
+              )
+              .join("\n\n");
+
+            try {
+              // Check if file exists and needs a preceding newline
+              let fileExists = false;
+              try {
+                await fsp.access(indexFilePath);
+                fileExists = true;
+              } catch {}
+
+              const contentToAppend =
+                (fileExists ? "\n\n" : "") + newEntriesContent;
+
+              await fsp.appendFile(indexFilePath, contentToAppend); // Append new entries
+              p.log.success(
+                `${
+                  this.indexEntries.length
+                } new entries appended to index: ${path.relative(
+                  this.paths.baseDocsDir,
+                  indexFilePath
+                )}`
+              );
+            } catch (e) {
+              p.log.error(`Index append error: ${e.message}`);
+              console.error("\n--- Index Append Error ---\n", e, "\n---");
+            }
+          } else {
+            p.log.info("No new entries to append to index.");
+          }
+        }
+      }
+    } else p.log.info("No index entries generated.");
+    p.outro(
+      color.green(
+        `✅ Processing Complete! Success: ${this.generationStats.success}, Failed: ${this.generationStats.error}, Skipped: ${this.generationStats.skipped}`
+      )
+    );
+  };
+
+  /**
+   * The main public method to orchestrate the entire documentation generation process.
+   * Handles SIGINT, clears console, prompts user for options, initiates crawling,
+   * prepares tasks, starts concurrent processing, and handles final output.
+   * Catches potential unhandled errors during the run.
+   * @returns {Promise<void>}
+   */
+  run = async () => {
+    process.on("SIGINT", () => {
+      if (this.spinnerInterval) clearInterval(this.spinnerInterval);
+      try {
+        if (typeof logUpdate.done === "function") logUpdate.done();
+        else if (logUpdate.clear) logUpdate.clear();
+      } catch {}
+
+      // Attempt to write the current index state before exiting
+      if (generator && generator.paths?.siteDocsDir) {
+        try {
+          const indexFilePath = path.join(
+            generator.paths.siteDocsDir,
+            "index.md"
+          );
+
+          if (generator.options.shouldRegenerate) {
+            // --- Regenerate Mode on Exit: Overwrite ---
+            const indexContent = generator.#generateIndexContent();
+            if (indexContent) {
+              p.log.warn(
+                `Process interrupted. Regenerating index at ${indexFilePath}...`
+              );
+              fs.writeFileSync(indexFilePath, indexContent); // Overwrite
+              p.log.success("Index regenerated.");
+            } else {
+              p.log.warn(
+                "Could not generate index content on exit (Regenerate Mode)."
+              );
+            }
+          } else {
+            // --- Append Mode on Exit: Append new entries ---
+            if (generator.indexEntries.length > 0) {
+              const newEntriesContent = generator.indexEntries
+                .map(
+                  (e) =>
+                    `- ${e.title}\n  - Path to file: ${e.path}\n  - Description: ${e.description}`
+                )
+                .join("\n\n");
+
+              p.log.warn(
+                `Process interrupted. Appending ${generator.indexEntries.length} new entries to ${indexFilePath}...`
+              );
+              // Check if file exists and needs a preceding newline
+              let fileExists = false;
+              try {
+                fs.accessSync(indexFilePath); // Use sync version
+                fileExists = true;
+              } catch {}
+              const contentToAppend =
+                (fileExists ? "\n\n" : "") + newEntriesContent;
+
+              fs.appendFileSync(indexFilePath, contentToAppend); // Append using sync
+              p.log.success("New entries appended.");
+            } else {
+              p.log.info("Process interrupted. No new entries to append.");
+            }
+          }
+        } catch (e) {
+          p.log.error(`Failed to write index on exit: ${e.message}`);
+        }
+      }
+
+      // Print full list on exit
+      if (generator) {
+        // Check if generator exists
+        console.log(generator.#renderFullTaskList());
+        console.log("-----------------------------------");
+      }
+      p.cancel("Operation cancelled by user.");
+      process.exit(130);
+    });
+
+    console.clear();
+    p.intro(color.inverse(" Docs Crawler & Generator 🚀 "));
+
+    // --- Configure and Parse CLI Arguments with Yargs ---
+    const yargs = Yargs(hideBin(process.argv));
+    const argv = await yargs
+      .option("b", {
+        alias: "baseUrl",
+        describe: "Base URL to crawl",
+        type: "string",
+        demandOption: false,
+      })
+      .option("o", {
+        alias: "outputDir",
+        describe: "Output directory",
+        type: "string",
+        default: DEFAULT_OUTPUT_DIR,
+      })
+      .option("p", {
+        alias: "projectName",
+        describe: "Project folder name (defaults to domain)",
+        type: "string",
+        default: DEFAULT_PROJECT_NAME,
+      })
+      .option("e", {
+        alias: "excludePaths",
+        describe: "Comma-separated paths to exclude (e.g., /api,/foo)",
+        type: "string",
+        default: DEFAULT_EXCLUDE_PATHS,
+      })
+      .option("r", {
+        alias: "shouldRegenerate",
+        describe: "Regenerate existing files?",
+        type: "boolean",
+        default: DEFAULT_SHOULD_RESTART,
+      })
+      .option("c", {
+        alias: "maxConcurrent",
+        describe: "Max concurrent AI requests",
+        type: "string",
+        default: DEFAULT_MAX_CONCURRENT,
+      })
+      .help()
+      .alias("help", "h")
+      .parseAsync(); // Use parseAsync for potential async operations
+
+    // --- 1. Get Options --- (Conditionally)
+    let opts = {};
+    let skipPrompts = false;
+
+    if (argv.baseUrl) {
+      try {
+        new URL(argv.baseUrl);
+        p.log.info("Base URL provided via CLI, skipping prompts...");
+        opts = { ...argv }; // Use the parsed argv (includes defaults)
+        skipPrompts = true;
+      } catch {
+        p.log.warn(
+          "Invalid Base URL provided via CLI. Falling back to interactive prompts."
+        );
+      }
+    }
+
+    if (!skipPrompts) {
+      // --- Interactive Prompts --- (Original p.group)
+      opts = await p.group(
+        {
+          baseUrl: () =>
+            p.text({
+              message: "Enter the base URL:",
+              placeholder: "https://docs.example.com",
+              validate: (v) => {
+                if (!v) return "Required";
+                try {
+                  new URL(v);
+                } catch {
+                  return "Invalid URL";
+                }
+              },
+            }),
+          outputDir: () =>
+            p.text({
+              message: "Output directory:",
+              initialValue: DEFAULT_OUTPUT_DIR,
+            }),
+          projectName: () =>
+            p.text({
+              message: "Project folder name (inside output directory):",
+              placeholder: "(Leave blank to use domain name)",
+              initialValue: DEFAULT_PROJECT_NAME,
+            }),
+          excludePaths: () =>
+            p.text({
+              message:
+                "Exclude paths? (Comma-separated, e.g., /api,/examples):",
+              placeholder: "No exclusions",
+              initialValue: DEFAULT_EXCLUDE_PATHS,
+            }),
+          shouldRegenerate: () =>
+            p.confirm({
+              message: "Regenerate existing files?",
+              initialValue: DEFAULT_SHOULD_RESTART,
+            }),
+          maxConcurrent: () =>
+            p.text({
+              message: "Max concurrent requests:",
+              initialValue: DEFAULT_MAX_CONCURRENT,
+              validate: (v) =>
+                v && Number.isInteger(+v) && +v > 0
+                  ? undefined
+                  : "Positive integer required",
+            }),
+        },
+        {
+          onCancel: () => {
+            p.cancel("Operation cancelled.");
+            process.exit(0);
+          },
+        }
+      );
+    }
+
+    // --- Assign Options to Class Property --- (Moved earlier)
+    this.options = {
+      baseUrl: opts.baseUrl,
+      outputDir: opts.outputDir, // Defaults applied by yargs/prompts
+      projectName: opts.projectName, // Defaults applied by yargs/prompts
+      excludePaths: (opts.excludePaths || "") // Ensure split works even if empty
+        .split(",")
+        .map((p) => p.trim())
+        .filter(Boolean),
+      shouldRegenerate: opts.shouldRegenerate,
+      maxConcurrent: parseInt(opts.maxConcurrent, 10), // ParseInt needed
+    };
+
+    // Validate maxConcurrent after potential parsing
+    if (
+      !Number.isInteger(this.options.maxConcurrent) ||
+      this.options.maxConcurrent <= 0
+    ) {
+      p.log.error(
+        `Invalid Max Concurrent value: ${opts.maxConcurrent}. Must be a positive integer.`
+      );
+      process.exit(1);
+    }
+
+    // --- 2. Crawl --- (Calling class method)
+    const s = p.spinner();
+    s.start(`Crawling from ${this.options.baseUrl}...`);
+    let dataMap;
+    try {
+      dataMap = await this.#crawlWebsite(
+        this.options.baseUrl,
+        this.options.excludePaths
+      );
+      s.stop(`Crawling complete. Found ${dataMap?.size || 0} pages.`);
+
+      // Log the found paths
+      if (dataMap && dataMap.size > 0) {
+        const pathsList = Array.from(dataMap.keys()).join("\n");
+        p.note(`Found paths:\n${pathsList}`, "Crawled URLs");
+      }
+    } catch (e) {
+      s.stop("Crawling failed.");
+      p.log.error(`Crawling error: ${e.message}`);
+      process.exit(1);
+    }
+    if (!dataMap || dataMap.size === 0) {
+      p.log.warn("Crawl finished - no data.");
+      process.exit(0);
+    }
+
+    // --- 3. Prepare Tasks & Dirs --- (Logic moved slightly)
+    p.log.step("Preparing tasks and directories...");
+    let domain = this.options.projectName
+      ? this.#sanitize(this.options.projectName)
+      : "";
+    if (!domain) {
+      try {
+        domain = new URL(this.options.baseUrl).hostname.replace(/^www\./, "");
+      } catch {
+        domain = "unknown-site";
+      }
+    }
+    this.paths.baseDocsDir = path.resolve(
+      process.cwd(),
+      this.options.outputDir
+    );
+    this.paths.siteDocsDir = path.join(this.paths.baseDocsDir, domain);
+    try {
+      await fsp.mkdir(this.paths.siteDocsDir, { recursive: true });
+      p.log.info(`Outputting to: ${this.paths.siteDocsDir}`);
+    } catch (e) {
+      p.log.error(`Directory error: ${e.message}`);
+      console.error("\n---", e, "\n---");
+      process.exit(1);
+    }
+
+    // Calculate base path segments from startUrl ONCE
+    let baseUrlPathSegments = [];
+    try {
+      baseUrlPathSegments = new URL(this.options.baseUrl).pathname
+        .split("/")
+        .filter(Boolean);
+    } catch {
+      p.log.warn("Could not parse startUrl to determine base path segments.");
+    }
+
+    this.tasksToRun = []; // Store tasks to run here
+    this.tasksState = {};
+    this.generationStats = { success: 0, error: 0, skipped: 0 };
+    this.indexEntries.length = 0;
+    for (const [url, bodyHTML] of dataMap.entries()) {
+      if (!bodyHTML) continue;
+      // Pass base segments to filename generator
+      const filename = this.#generateFilenameFromUrl(url, baseUrlPathSegments);
+      const filePath = path.join(this.paths.siteDocsDir, filename);
+      const relativePath = path.relative(this.paths.baseDocsDir, filePath);
+
+      this.tasksState[relativePath] = {
+        url,
+        bodyHTML,
+        filePath,
+        relativePath,
+        filename,
+        status: "pending",
+        message: "",
+        chunkInfo: "",
+      };
+      if (!this.options.shouldRegenerate && fs.existsSync(filePath)) {
+        this.tasksState[relativePath].status = "success";
+        this.generationStats.success++;
+      } else {
+        this.tasksToRun.push(relativePath);
+      }
+    }
+
+    if (this.tasksToRun.length === 0 && this.generationStats.success > 0) {
+      p.log.warn("All required files already exist.");
+      logUpdate(`\n${this.#renderProgressUpdate()}\n`);
+      this.#finishProcessing();
+      return;
+    } else if (this.tasksToRun.length === 0) {
+      p.log.warn("No new pages to generate.");
+      logUpdate(`\n${this.#renderProgressUpdate()}\n`);
+      if (typeof logUpdate.done === "function") logUpdate.done();
+      else if (logUpdate.clear) logUpdate.clear();
+      p.outro("✅ Done (no new files generated).");
+      process.exit(0);
+    }
+    p.log.step(
+      `Starting generation for ${this.tasksToRun.length} pages (Concurrency: ${this.options.maxConcurrent})...`
+    );
+
+    // --- 4. Run Concurrently --- (Start spinner and runNext)
+    if (!this.spinnerInterval) {
+      this.spinnerInterval = setInterval(() => {
+        this.spinnerFrameIndex =
+          (this.spinnerFrameIndex + 1) % SPINNER_FRAMES.length;
+        if (
+          this.activePromises.size > 0 ||
+          this.taskQueueIndex < this.tasksToRun.length
+        )
+          logUpdate(`\n${this.#renderProgressUpdate()}\n`);
+      }, SPINNER_DELAY);
+    }
+    logUpdate(`\n${this.#renderProgressUpdate()}\n`);
+    this.activePromises.clear();
+    this.taskQueueIndex = 0;
+    this.processingFinished = false;
+    this.#runNext(); // Start the process
+  };
 }
 
 // --- Run Main Application ---
-main().catch((err) => {
-  // Catch unhandled errors from the main async function
-  if (spinnerInterval) clearInterval(spinnerInterval); // Clear interval on error
+/**
+ * Creates an instance of the DocGenerator and executes its run method.
+ * Includes top-level error catching for unexpected failures.
+ */
+const generator = new DocGenerator();
+generator.run().catch((err) => {
+  // Catch unhandled errors from the main run method
+  // SIGINT handler should catch Ctrl+C, this is for other unexpected errors
+  if (generator.spinnerInterval) clearInterval(generator.spinnerInterval); // Access interval via instance
+  try {
+    if (typeof logUpdate.done === "function") logUpdate.done();
+    else if (logUpdate.clear) logUpdate.clear();
+  } catch {}
   p.log.error("An unexpected error occurred during the main process:");
   console.error("\n--- Unhandled Main Error ---\n", err, "\n---");
   p.outro(color.red("❌ Process terminated due to an unexpected error."));
