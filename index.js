@@ -875,7 +875,7 @@ class DocGenerator {
     }
 
     if (!skipPrompts) {
-      // --- Interactive Prompts --- (Original p.group)
+      // --- Interactive Prompts ---
       opts = await p.group(
         {
           baseUrl: () =>
@@ -933,7 +933,7 @@ class DocGenerator {
       );
     }
 
-    // --- Assign Options to Class Property --- (Moved earlier)
+    // --- Assign Options to Class Property ---
     this.options = {
       baseUrl: opts.baseUrl,
       outputDir: opts.outputDir, // Defaults applied by yargs/prompts
@@ -957,7 +957,7 @@ class DocGenerator {
       process.exit(1);
     }
 
-    // --- 2. Crawl --- (Calling class method)
+    // --- 2. Crawl ---
     const s = p.spinner();
     s.start(`Crawling from ${this.options.baseUrl}...`);
     let dataMap;
@@ -983,7 +983,7 @@ class DocGenerator {
       process.exit(0);
     }
 
-    // --- 3. Prepare Tasks & Dirs --- (Logic moved slightly)
+    // --- 3. Prepare Tasks & Dirs ---
     p.log.step("Preparing tasks and directories...");
     let domain = this.options.projectName
       ? this.#sanitize(this.options.projectName)
